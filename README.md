@@ -4,7 +4,7 @@ Infraestructura en AWS organizada en **3 capas** con balanceador Apache, servido
 
 ---
 
-## Arquitectura General
+### Arquitectura General
 
 ```text
 [Internet] --> [Capa 1: Balanceador Apache + EIP + SSL]
@@ -23,7 +23,7 @@ Infraestructura en AWS organizada en **3 capas** con balanceador Apache, servido
             [Capa 3: MariaDB]
                  10.0.3.111
 ```
-##Instalacion de la estructura
+###Instalacion de la estructura
 El primer paso es crear una vpc. Para ello en el buscador escribe VPC y crear una vpc. Pon el nombre que quieras ( en mi caso, VPC-fj ).
 
 <img width="1425" height="280" alt="VPC" src="https://github.com/user-attachments/assets/0e724ab8-a92f-4cba-baa1-b29edc5ecd85" />
@@ -39,7 +39,7 @@ Ahora crea 2 tablas de enrutamiento. 1 de ellas se enlazara con la subred públi
 <img width="1445" height="325" alt="gateway" src="https://github.com/user-attachments/assets/5a8a388b-d5c6-4f0f-9cf0-658e63e47622" />
 Haz lo mismo pero añade las privadas
 <img width="1532" height="327" alt="enrutamiento_privada" src="https://github.com/user-attachments/assets/b7ea0900-2b90-4fbd-b48e-d6ced84d0636" />
-##Grupos de seguridad
+###Grupos de seguridad
 Necesitas crear 1 grupo de seguridad por instancia:
 * Balanceador
 * Servidores web
@@ -54,28 +54,159 @@ Necesitas crear 1 grupo de seguridad por instancia:
   <img width="1422" height="326" alt="gs_nfs" src="https://github.com/user-attachments/assets/b6d2d3d8-24d3-4f1a-96ae-8989da74559b" />
   #Base de datos
   <img width="1498" height="377" alt="image" src="https://github.com/user-attachments/assets/7fca4e34-b5a3-4fb9-9b97-ac9121387d87" />
-##Instancias
+###Instancias
+
 Pon en el buscardor EC2 y en el apartado de Instancias, crear nueva instancia.
-#Balanceador
+##Balanceador
 La primera instancia a crear es el balanceador.
 Debemos asignarle un nombre y como ISO usaremos debian. Elige tu vpc y como grupo de seguridad elige la sg del balanceador. Le asignamos la red pública y que amazon eliga nuestra ip pública. En detalles avanzados pon el siguiente scripts:
 ```
+#!/bin/bash
+sudo hostnamectl set-hostname balanceador
+
+sudo apt update
+sudo apt install apache2 -y
+sudo a2enmod proxy proxy_http proxy_balancer lbmethod_byrequests proxy_connect ssl headers
+
+sudo systemctl restart apache2
+
+sudo cp /etc/apache2/sites-available/000-default.conf /etc/apache2/sites-available/load-balancer.conf
+
+sudo tee /etc/apache2/sites-available/load-balancer.conf > /dev/null <<EOF
+<VirtualHost *:80>
+    ServerName fjpereirab.online
+    Redirect permanent / https://fjpereirab.online/
+</VirtualHost>
+EOF
+
+sudo tee /etc/apache2/sites-available/load-balancer-ssl.conf > /dev/null <<EOF
+<IfModule mod_ssl.c>
+<VirtualHost *:443>
+    ServerName fjpereirab.online
+
+    SSLEngine On
+    SSLCertificateFile /etc/letsencrypt/live/fjpereirab.online/fullchain.pem
+    SSLCertificateKeyFile /etc/letsencrypt/live/fjpereirab.online/privkey.pem
+
+    <Proxy "balancer://mycluster">
+        ProxySet stickysession=JSESSIONID|ROUTEID
+        BalancerMember http://10.0.2.45:80
+        BalancerMember http://10.0.2.184:80
+    </Proxy>
+
+    ProxyPass "/" "balancer://mycluster/"
+    ProxyPassReverse "/" "balancer://mycluster/"
+</VirtualHost>
+</IfModule>
+EOF
+
+sudo a2dissite 000-default.conf
+sudo a2ensite load-balancer.conf
+sudo a2ensite load-balancer-ssl.conf
+sudo systemctl reload apache2
 ```
 <img width="1385" height="387" alt="balanceador" src="https://github.com/user-attachments/assets/ddcb25d6-914f-486e-a2ef-0631c7b22ae6" />
-#Servidores web ( 2 veces: web1 y web2 ) 
+##Servidores web ( 2 veces: web1 y web2 ) 
 
 A esta instancia asignale tu vpc y la red privada 1. En este caso no permitiremos que amazon eliga ip pública y su sg sera el web. Pon el siguiente script para ambas instancias:
 ```
+#!/bin/bash
+set -e
+sudo hostnamectl set-hostname webfj
+
+sudo apt update
+sudo apt install nfs-common apache2 php libapache2-mod-php php-mysql php-curl php-gd php-xml php-mbstring php-xmlrpc php-zip php-soap php-intl -y
+
+sudo mkdir -p /nfs/general
+
+sudo mount 10.0.2.24:/var/nfs/general /nfs/general
+echo "10.0.2.24:/var/nfs/general  /nfs/general  nfs _netdev,auto,nofail,noatime,nolock,intr,tcp,actimeo=1800 0 0" | sudo tee -a /etc/fstab
+
+sudo cp /etc/apache2/sites-available/000-default.conf /etc/apache2/sites-available/wordpress.conf
+
+sudo tee /etc/apache2/sites-available/wordpress.conf > /dev/null <<EOF
+<VirtualHost *:80>
+    ServerName https://fjpereirab.online
+    DocumentRoot /nfs/general/wordpress/
+
+    <Directory /nfs/general/wordpress>
+        Options +FollowSymlinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+
+sudo a2dissite 000-default.conf
+sudo a2ensite wordpress.conf
+sudo systemctl reload apache2
+
 ```
 <img width="1318" height="352" alt="web" src="https://github.com/user-attachments/assets/a40caf7c-ad0e-4c67-a76b-79ba6957b533" />
-#NFS
+##NFS
+
 Realiza la misma configuracion para los servidores web cambiando el sg por el sg del nfs y pon el siguiente script:
+
 ```
+#!/bin/bash
+set -e
+sudo hostnamectl set-hostname nfs-fj
+
+sudo apt update
+sudo apt install nfs-kernel-server -y
+
+
+sudo mkdir -p /var/nfs/general
+sudo chown nobody:nogroup /var/nfs/general
+
+
+echo "/var/nfs/general 10.0.2.72(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+echo "/var/nfs/general 10.0.2.238(rw,sync,no_subtree_check)" | sudo tee -a /etc/exports
+
+
+sudo apt install unzip -y
+sudo wget -O /var/nfs/general/latest.zip https://wordpress.org/latest.zip
+sudo unzip /var/nfs/general/latest.zip -d /var/nfs/general/
+
+
+sudo chown -R www-data:www-data /var/nfs/general/wordpress
+sudo find /var/nfs/general/wordpress/ -type d -exec chmod 755 {} \;
+sudo find /var/nfs/general/wordpress/ -type f -exec chmod 644 {} \;
+sudo systemctl restart nfs-kernel-server
+sudo exportfs -a
+
 ```
 <img width="1283" height="375" alt="image" src="https://github.com/user-attachments/assets/7be51094-a8d7-42ee-ad9e-3b40ae481a74" />
-#Base de datos
+
+##Base de datos
+
 Realiza la configuración asociandolo a tu vpc y eligiendo la red privada 2. El sg sera el de la BD y su script es:
+
 ```
+set -e
+
+sudo hostnamectl set-hostname db-fj
+
+
+sudo apt update
+sudo apt install mariadb-server -y
+
+sudo mysql <<EOF
+CREATE DATABASE fjwordpress DEFAULT CHARACTER SET utf8 COLLATE utf8_unicode_ci;
+
+CREATE USER 'fj'@'10.0.2.72' IDENTIFIED BY 'abcd';
+GRANT ALL PRIVILEGES ON wordpress.* TO 'fj'@'10.0.2.72';
+
+CREATE USER 'fj'@'10.0.2.238' IDENTIFIED BY 'abcd';
+GRANT ALL PRIVILEGES ON wordpress.* TO 'fj'@'10.0.2.238';
+
+FLUSH PRIVILEGES;
+EOF
+
+sudo sed -i 's/^bind-address.*/bind-address = 10.0.3.111/' /etc/mysql/mariadb.conf.d/50-server.cnf
+
+sudo systemctl restart mariadb
+
 ```
 <img width="1385" height="367" alt="image" src="https://github.com/user-attachments/assets/85c3d4ef-048f-4e00-8e64-e1b5705f461a" />
 
